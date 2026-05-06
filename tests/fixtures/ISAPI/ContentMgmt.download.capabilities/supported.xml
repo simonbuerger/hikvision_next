@@ -1,0 +1,5 @@
+<DownloadAbility version="2.0" xmlns="http://www.isapi.org/ver20/XMLSchema">
+  <isSupportDownloadbyTime>true</isSupportDownloadbyTime>
+  <isSupportDownloadbyFileName>true</isSupportDownloadbyFileName>
+  <isSupportDownloadToUSB>false</isSupportDownloadToUSB>
+</DownloadAbility>
