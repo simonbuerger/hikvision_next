@@ -9,7 +9,7 @@ import ipaddress
 import json
 import logging
 from typing import Any, AsyncIterator
-from urllib.parse import quote, urljoin, urlparse
+from urllib.parse import parse_qs, quote, urljoin, urlparse
 
 import httpx
 from httpx import HTTPStatusError
@@ -34,12 +34,14 @@ from .models import (
     AlertInfo,
     AnalogCamera,
     CameraStreamInfo,
+    DownloadAbility,
     CapabilitiesInfo,
     EventInfo,
     IPCamera,
     ISAPIDeviceInfo,
     MutexIssue,
     ProtocolsInfo,
+    RecordingInfo,
     StorageInfo,
 )
 from .utils import bool_to_str, deep_get, parse_isapi_response, str_to_bool
@@ -453,6 +455,151 @@ class ISAPIClient:
         except IndexError:
             # Storage id does not exist
             return None
+
+    async def get_download_capabilities(self) -> DownloadAbility:
+        """Get recording download capabilities."""
+        result = await self.request(GET, "ContentMgmt/download/capabilities")
+        ability = result.get("DownloadAbility", {})
+        return DownloadAbility(
+            by_time=str_to_bool(ability.get("isSupportDownloadbyTime", "false")),
+            by_file_name=str_to_bool(ability.get("isSupportDownloadbyFileName", "false")),
+            to_usb=str_to_bool(ability.get("isSupportDownloadToUSB", "false")),
+        )
+
+    async def search_recordings(
+        self,
+        camera_id: int,
+        start_time: datetime.datetime,
+        end_time: datetime.datetime,
+        max_results: int = 64,
+    ) -> list[RecordingInfo]:
+        """Search recordings for one camera and time range."""
+        camera = self.get_camera_by_id(camera_id)
+        track_id = camera.streams[0].id if camera and camera.streams else camera_id * 100 + 1
+        search_id = f"hikvision-next-{camera_id}-{int(start_time.timestamp())}-{int(end_time.timestamp())}"
+        payload = xmltodict.unparse(
+            {
+                "CMSearchDescription": {
+                    "@version": "1.0",
+                    "@xmlns": "http://www.isapi.org/ver20/XMLSchema",
+                    "searchID": search_id,
+                    "trackIDList": {"trackID": track_id},
+                    "timeSpanList": {
+                        "timeSpan": {
+                            "startTime": self._format_recording_time(start_time),
+                            "endTime": self._format_recording_time(end_time),
+                        }
+                    },
+                    "maxResults": max_results,
+                    "searchResultPosition": 0,
+                    "metadataList": {"metadataDescriptor": "//recordType.meta.std-cgi.com"},
+                }
+            },
+            full_document=False,
+        )
+        result = await self.request(POST, "ContentMgmt/search", data=payload)
+        return self._parse_recording_search_result(camera_id, result)
+
+    async def download_recording(self, playback_uri: str) -> AsyncIterator[bytes]:
+        """Download recording bytes for a playback URI returned by search."""
+        payload = xmltodict.unparse(
+            {
+                "downloadRequest": {
+                    "@version": "1.0",
+                    "@xmlns": "http://www.isapi.org/ver20/XMLSchema",
+                    "playbackURI": playback_uri,
+                }
+            },
+            full_document=False,
+        )
+        full_url = self.get_isapi_url("ContentMgmt/download")
+        async for chunk in self.request_bytes(
+            POST,
+            full_url,
+            data=payload,
+            headers={"Content-Type": "application/xml"},
+            timeout=None,
+        ):
+            yield chunk
+
+    @staticmethod
+    def _format_recording_time(value: datetime.datetime) -> str:
+        """Format a datetime for ContentMgmt recording search."""
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=datetime.UTC)
+        return value.astimezone(datetime.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    def _parse_recording_search_result(self, camera_id: int, result: dict) -> list[RecordingInfo]:
+        """Parse ContentMgmt search response into recording info."""
+        items = deep_get(result, "CMSearchResult.matchList.searchMatchItem", [])
+        if not items:
+            items = deep_get(result, "CMSearchResult.searchMatchItemList.searchMatchItem", [])
+        if not items:
+            return []
+        if not isinstance(items, list):
+            items = [items]
+
+        recordings = []
+        for item in items:
+            playback_uri = item.get("playbackURI") or deep_get(item, "mediaSegmentDescriptor.playbackURI")
+            if not playback_uri:
+                continue
+
+            time_span = item.get("timeSpan") or deep_get(item, "mediaSegmentDescriptor.timeSpan", {})
+            start_time = self._parse_recording_time(time_span.get("startTime"))
+            end_time = self._parse_recording_time(time_span.get("endTime"))
+            if not start_time or not end_time:
+                continue
+
+            parsed_uri = urlparse(playback_uri)
+            query = parse_qs(parsed_uri.query)
+            name = item.get("name") or query.get("name", [""])[0]
+            size = self._parse_int(item.get("size") or query.get("size", [0])[0])
+            track_id = self._parse_int(item.get("trackID") or query.get("trackID", [0])[0])
+            if not track_id:
+                track_id = self._parse_int(parsed_uri.path.rstrip("/").split("/")[-1])
+
+            recordings.append(
+                RecordingInfo(
+                    camera_id=camera_id,
+                    track_id=track_id,
+                    start_time=start_time,
+                    end_time=end_time,
+                    playback_uri=playback_uri,
+                    name=name,
+                    size=size,
+                    content_type=self._guess_recording_content_type(name),
+                )
+            )
+        return recordings
+
+    @staticmethod
+    def _parse_recording_time(value: str | None) -> datetime.datetime | None:
+        """Parse an ISAPI recording timestamp."""
+        if not value:
+            return None
+        with suppress(ValueError):
+            return datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+        with suppress(ValueError):
+            return datetime.datetime.strptime(value, "%Y-%m-%d %H:%M:%S").replace(tzinfo=datetime.UTC)
+        return None
+
+    @staticmethod
+    def _parse_int(value: Any) -> int:
+        """Parse an integer and return zero when parsing fails."""
+        with suppress(TypeError, ValueError):
+            return int(value)
+        return 0
+
+    @staticmethod
+    def _guess_recording_content_type(name: str) -> str:
+        """Guess the content type from a recording name."""
+        lower_name = name.lower()
+        if lower_name.endswith(".mp4"):
+            return "video/mp4"
+        if lower_name.endswith((".mpeg", ".mpg", ".ps")):
+            return "video/mpeg"
+        return "video/mp4"
 
     def _get_event_state_node(self, event: EventInfo) -> str:
         """Get xml key for event state."""

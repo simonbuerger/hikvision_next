@@ -1,0 +1,30 @@
+<CMSearchResult version="2.0" xmlns="http://www.isapi.org/ver20/XMLSchema">
+  <searchID>hikvision-next-test</searchID>
+  <responseStatus>true</responseStatus>
+  <responseStatusStrg>OK</responseStatusStrg>
+  <numOfMatches>2</numOfMatches>
+  <matchList>
+    <searchMatchItem>
+      <sourceID>{00000000-0000-0000-0000-000000000000}</sourceID>
+      <trackID>101</trackID>
+      <timeSpan>
+        <startTime>2026-05-06T10:00:00Z</startTime>
+        <endTime>2026-05-06T10:05:00Z</endTime>
+      </timeSpan>
+      <mediaSegmentDescriptor>
+        <playbackURI>rtsp://1.0.0.255/Streaming/tracks/101?starttime=2026-05-06T10:00:00Z&amp;endtime=2026-05-06T10:05:00Z&amp;name=clip-one.mp4&amp;size=1234</playbackURI>
+      </mediaSegmentDescriptor>
+    </searchMatchItem>
+    <searchMatchItem>
+      <sourceID>{00000000-0000-0000-0000-000000000001}</sourceID>
+      <trackID>101</trackID>
+      <timeSpan>
+        <startTime>2026-05-06T11:00:00Z</startTime>
+        <endTime>2026-05-06T11:03:00Z</endTime>
+      </timeSpan>
+      <mediaSegmentDescriptor>
+        <playbackURI>rtsp://1.0.0.255/Streaming/tracks/101?starttime=2026-05-06T11:00:00Z&amp;endtime=2026-05-06T11:03:00Z&amp;name=clip-two.mp4&amp;size=5678</playbackURI>
+      </mediaSegmentDescriptor>
+    </searchMatchItem>
+  </matchList>
+</CMSearchResult>

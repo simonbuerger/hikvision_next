@@ -1,4 +1,5 @@
 from dataclasses import dataclass, field
+from datetime import datetime
 
 
 @dataclass
@@ -75,6 +76,29 @@ class StorageInfo:
     freespace: int
     property: str
     ip: str = ""
+
+
+@dataclass
+class DownloadAbility:
+    """Holds recording download capability info."""
+
+    by_time: bool = False
+    by_file_name: bool = False
+    to_usb: bool = False
+
+
+@dataclass
+class RecordingInfo:
+    """Holds info for one recording search match."""
+
+    camera_id: int
+    track_id: int
+    start_time: datetime
+    end_time: datetime
+    playback_uri: str
+    name: str = ""
+    size: int = 0
+    content_type: str = "video/mp4"
 
 
 @dataclass
