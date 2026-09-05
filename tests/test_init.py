@@ -3,6 +3,7 @@
 import pytest
 from unittest.mock import AsyncMock, patch
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers import device_registry as dr
 from custom_components.hikvision_next.const import DOMAIN
 from custom_components.hikvision_next.hikvision_device import HikvisionDevice
 from pytest_homeassistant_custom_component.common import MockConfigEntry
@@ -39,6 +40,33 @@ async def test_basic_init(hass: HomeAssistant, init_integration: MockConfigEntry
     device: HikvisionDevice = entry.runtime_data
     assert device.host == TEST_CONFIG["host"]
     assert init_integration.title in device.device_info.model
+
+
+@pytest.mark.parametrize("init_integration", ["DS-7608NXI-I2"], indirect=True)
+async def test_nvr_cameras_are_linked_to_the_nvr(hass: HomeAssistant, init_integration: MockConfigEntry) -> None:
+    """Test camera devices of an NVR are linked to the NVR device."""
+    entry = init_integration
+    device: HikvisionDevice = entry.runtime_data
+    device_registry = dr.async_get(hass)
+    devices = dr.async_entries_for_config_entry(device_registry, entry.entry_id)
+
+    nvr_device = next(
+        entry_device
+        for entry_device in devices
+        if (DOMAIN, device.device_info.serial_no) in entry_device.identifiers
+    )
+    camera_devices = [entry_device for entry_device in devices if entry_device.id != nvr_device.id]
+    assert camera_devices
+    assert all(camera_device.via_device_id == nvr_device.id for camera_device in camera_devices)
+
+
+@pytest.mark.parametrize("init_integration", ["DS-2CD2386G2-IU"], indirect=True)
+async def test_standalone_camera_is_not_linked(hass: HomeAssistant, init_integration: MockConfigEntry) -> None:
+    """Test a standalone IP camera is not linked to another device."""
+    device_registry = dr.async_get(hass)
+    devices = dr.async_entries_for_config_entry(device_registry, init_integration.entry_id)
+    assert devices
+    assert all(device.via_device_id is None for device in devices)
 
 
 @pytest.mark.parametrize("init_integration", ["DS-7608NXI-I2"], indirect=True)
