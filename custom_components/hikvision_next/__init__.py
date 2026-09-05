@@ -18,6 +18,7 @@ from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
 from homeassistant.helpers import device_registry as dr, entity_registry as er
 from homeassistant.helpers.typing import ConfigType
 
+from . import media_source  # noqa: F401
 from .const import DOMAIN
 from .hikvision_device import HikvisionDevice
 from .isapi import ISAPIUnauthorizedError

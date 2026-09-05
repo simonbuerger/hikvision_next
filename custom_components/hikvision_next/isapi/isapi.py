@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from contextlib import suppress
 import datetime
 from http import HTTPStatus
@@ -9,10 +10,12 @@ import ipaddress
 import json
 import logging
 from typing import Any, AsyncIterator
-from urllib.parse import quote, urljoin, urlparse
+from urllib.parse import parse_qs, quote, urljoin, urlparse, urlunparse
+from uuid import uuid4
 
 import httpx
 from httpx import HTTPStatusError
+from homeassistant.util import dt as dt_util
 import xmltodict
 
 from .const import (
@@ -34,12 +37,15 @@ from .models import (
     AlertInfo,
     AnalogCamera,
     CameraStreamInfo,
+    DownloadAbility,
     CapabilitiesInfo,
     EventInfo,
     IPCamera,
     ISAPIDeviceInfo,
     MutexIssue,
     ProtocolsInfo,
+    RecordingPictureInfo,
+    RecordingInfo,
     StorageInfo,
 )
 from .utils import bool_to_str, deep_get, parse_isapi_response, str_to_bool
@@ -47,6 +53,41 @@ from .utils import bool_to_str, deep_get, parse_isapi_response, str_to_bool
 Node = dict[str, Any]
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def _dedupe_recordings(recordings: list[RecordingInfo]) -> list[RecordingInfo]:
+    """Remove repeated recording matches while preserving order."""
+    seen = set()
+    deduped = []
+    for recording in recordings:
+        key = recording.playback_uri or (
+            recording.track_id,
+            recording.start_time,
+            recording.end_time,
+            recording.name,
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(recording)
+    return deduped
+
+
+def _dedupe_recording_pictures(pictures: list[RecordingPictureInfo]) -> list[RecordingPictureInfo]:
+    """Remove repeated picture matches while preserving order."""
+    seen = set()
+    deduped = []
+    for picture in pictures:
+        key = picture.playback_uri or (
+            picture.track_id,
+            picture.start_time,
+            picture.end_time,
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(picture)
+    return deduped
 
 
 class ISAPIClient:
@@ -233,8 +274,32 @@ class ISAPIClient:
                 if self.rtsp_port_forced:
                     self.protocols.rtsp_port = str(self.rtsp_port_forced)
                 else:
-                    self.protocols.rtsp_port = item.get("portNo")
+                    rtsp_port = int(item["portNo"])
+                    if rtsp_port != 554 and not await self._is_rtsp_port_open(rtsp_port):
+                        if await self._is_rtsp_port_open(554):
+                            _LOGGER.warning(
+                                "RTSP port %s is unreachable on %s; falling back to port 554",
+                                rtsp_port,
+                                self.device_info.ip_address,
+                            )
+                            rtsp_port = 554
+                    self.protocols.rtsp_port = str(rtsp_port)
                 break
+
+    async def _is_rtsp_port_open(self, port: int) -> bool:
+        """Check whether an RTSP TCP port is reachable before using it."""
+        try:
+            _, writer = await asyncio.wait_for(
+                asyncio.open_connection(self.device_info.ip_address, port),
+                timeout=1,
+            )
+        except (OSError, asyncio.TimeoutError):
+            return False
+
+        writer.close()
+        with suppress(Exception):
+            await writer.wait_closed()
+        return True
 
     async def get_supported_events(self, system_capabilities: dict) -> list[EventInfo]:
         """Get list of all supported events available."""
@@ -453,6 +518,413 @@ class ISAPIClient:
         except IndexError:
             # Storage id does not exist
             return None
+
+    async def get_download_capabilities(self) -> DownloadAbility:
+        """Get recording download capabilities."""
+        result = await self.request(GET, "ContentMgmt/download/capabilities")
+        ability = result.get("DownloadAbility", {})
+        return DownloadAbility(
+            by_time=str_to_bool(ability.get("isSupportDownloadbyTime", "false")),
+            by_file_name=str_to_bool(ability.get("isSupportDownloadbyFileName", "false")),
+            to_usb=str_to_bool(ability.get("isSupportDownloadToUSB", "false")),
+        )
+
+    async def search_recordings(
+        self,
+        camera_id: int,
+        start_time: datetime.datetime,
+        end_time: datetime.datetime,
+        max_results: int | None = 1000,
+    ) -> list[RecordingInfo]:
+        """Search recordings for one camera and time range."""
+        track_id = self._recording_track_id(camera_id)
+        search_id = str(uuid4()).upper()
+        if max_results is not None:
+            max_results = max(1, max_results)
+            page_size = min(100, max_results)
+        else:
+            page_size = 100
+        recordings: list[RecordingInfo] = []
+        last_status = ""
+        _LOGGER.debug(
+            "Searching recordings; camera_id=%s track_id=%s start=%s end=%s max_results=%s",
+            camera_id,
+            track_id,
+            self._format_recording_time(start_time),
+            self._format_recording_time(end_time),
+            max_results,
+        )
+        while max_results is None or len(recordings) < max_results:
+            start_position = len(recordings)
+            request_size = page_size if max_results is None else min(page_size, max_results - len(recordings))
+            payload = xmltodict.unparse(
+                {
+                    "CMSearchDescription": {
+                        "searchID": search_id,
+                        "trackList": {"trackID": track_id},
+                        "timeSpanList": {
+                            "timeSpan": {
+                                "startTime": self._format_recording_time(start_time),
+                                "endTime": self._format_recording_time(end_time),
+                            }
+                        },
+                        "maxResults": request_size,
+                        "searchResultPostion": start_position,
+                        "metadataList": {"metadataDescriptor": "recordType.meta.hikvision.com/AllEvent"},
+                    }
+                },
+                full_document=True,
+            )
+            result = await self.request(
+                POST,
+                "ContentMgmt/search",
+                data=payload,
+                headers={"Content-Type": "application/xml"},
+            )
+            page = self._parse_recording_search_result(camera_id, result)
+            previous_count = len(recordings)
+            recordings.extend(page)
+            recordings = _dedupe_recordings(recordings)
+            status = str(deep_get(result, "CMSearchResult.responseStatusStrg", "")).upper()
+            last_status = status
+            _LOGGER.debug(
+                "Recording search page; camera_id=%s track_id=%s start_position=%s requested=%s returned=%s total=%s status=%s",
+                camera_id,
+                track_id,
+                start_position,
+                request_size,
+                len(page),
+                len(recordings),
+                status,
+            )
+            if not page or len(recordings) == previous_count or status != "MORE":
+                break
+        if max_results is not None and len(recordings) >= max_results and last_status == "MORE":
+            _LOGGER.warning(
+                "Recording search reached max_results=%s and may be truncated; camera_id=%s track_id=%s start=%s end=%s",
+                max_results,
+                camera_id,
+                track_id,
+                self._format_recording_time(start_time),
+                self._format_recording_time(end_time),
+            )
+        return recordings if max_results is None else recordings[:max_results]
+
+    async def get_recording_daily_distribution(self, camera_id: int, year: int, month: int) -> set[int]:
+        """Return days with recordings for one camera and month."""
+        track_id = self._recording_track_id(camera_id)
+        payload = xmltodict.unparse(
+            {
+                "trackDailyParam": {
+                    "year": int(year),
+                    "monthOfYear": int(month),
+                }
+            },
+            full_document=True,
+        )
+        result = await self.request(
+            POST,
+            f"ContentMgmt/record/tracks/{track_id}/dailyDistribution",
+            data=payload,
+            headers={"Content-Type": "application/xml"},
+        )
+        days = deep_get(result, "trackDailyDistribution.dayList.day", [])
+        if not days:
+            return set()
+        if not isinstance(days, list):
+            days = [days]
+
+        available_days = set()
+        for day in days:
+            if not str_to_bool(str(day.get("record", "false"))):
+                continue
+            day_of_month = self._parse_int(day.get("dayOfMonth", day.get("id", 0)))
+            if 1 <= day_of_month <= 31:
+                available_days.add(day_of_month)
+        return available_days
+
+    async def search_recording_pictures(
+        self,
+        camera_id: int,
+        start_time: datetime.datetime,
+        end_time: datetime.datetime,
+        max_results: int | None = 1000,
+    ) -> list[RecordingPictureInfo]:
+        """Search static event pictures for one camera and time range."""
+        camera = self.get_camera_by_id(camera_id)
+        video_track_id = camera.streams[0].id if camera and camera.streams else camera_id * 100 + 1
+        track_id = self._picture_track_id(video_track_id)
+        search_id = str(uuid4()).upper()
+        if max_results is not None:
+            max_results = max(1, max_results)
+            page_size = min(100, max_results)
+        else:
+            page_size = 100
+        pictures: list[RecordingPictureInfo] = []
+        last_status = ""
+        _LOGGER.debug(
+            "Searching recording pictures; camera_id=%s track_id=%s start=%s end=%s max_results=%s",
+            camera_id,
+            track_id,
+            self._format_recording_picture_time(start_time),
+            self._format_recording_picture_time(end_time),
+            max_results,
+        )
+        while max_results is None or len(pictures) < max_results:
+            start_position = len(pictures)
+            request_size = page_size if max_results is None else min(page_size, max_results - len(pictures))
+            payload = xmltodict.unparse(
+                {
+                    "CMSearchDescription": {
+                        "searchID": search_id,
+                        "trackList": {"trackID": track_id},
+                        "timeSpanList": {
+                            "timeSpan": {
+                                "startTime": self._format_recording_picture_time(start_time),
+                                "endTime": self._format_recording_picture_time(end_time),
+                            }
+                        },
+                        "maxResults": request_size,
+                        "searchResultPostion": start_position,
+                        "metadataList": {"metadataDescriptor": "recordType.meta.hikvision.com/allPic"},
+                    }
+                },
+                full_document=True,
+            )
+            result = await self.request(
+                POST,
+                "ContentMgmt/search",
+                data=payload,
+                headers={"Content-Type": "application/xml"},
+            )
+            page = self._parse_recording_picture_search_result(camera_id, result)
+            previous_count = len(pictures)
+            pictures.extend(page)
+            pictures = _dedupe_recording_pictures(pictures)
+            status = str(deep_get(result, "CMSearchResult.responseStatusStrg", "")).upper()
+            last_status = status
+            _LOGGER.debug(
+                "Recording picture search page; camera_id=%s track_id=%s start_position=%s requested=%s returned=%s total=%s status=%s",
+                camera_id,
+                track_id,
+                start_position,
+                request_size,
+                len(page),
+                len(pictures),
+                status,
+            )
+            if not page or len(pictures) == previous_count or status != "MORE":
+                break
+        if max_results is not None and len(pictures) >= max_results and last_status == "MORE":
+            _LOGGER.warning(
+                "Recording picture search reached max_results=%s and may be truncated; camera_id=%s track_id=%s start=%s end=%s",
+                max_results,
+                camera_id,
+                track_id,
+                self._format_recording_picture_time(start_time),
+                self._format_recording_picture_time(end_time),
+            )
+        return pictures if max_results is None else pictures[:max_results]
+
+    def get_authenticated_recording_rtsp_source(self, playback_uri: str) -> str:
+        """Return an authenticated RTSP source for a recording playback URI."""
+        parsed = urlparse(playback_uri)
+        if parsed.scheme.lower() not in {"rtsp", "rtsps"}:
+            raise ValueError(f"Unsupported recording playback scheme: {parsed.scheme or '<missing>'}")
+        if parsed.hostname and not self._is_allowed_recording_host(parsed.hostname):
+            raise ValueError(f"Unexpected recording playback host: {parsed.hostname}")
+        host = parsed.hostname or self.device_info.ip_address
+        port = self.protocols.rtsp_port or parsed.port
+        username = quote(self.username, safe="")
+        password = quote(self.password, safe="")
+        netloc = f"{username}:{password}@{host}"
+        if port:
+            netloc = f"{netloc}:{port}"
+        return urlunparse(parsed._replace(netloc=netloc))
+
+    def _is_allowed_recording_host(self, host: str) -> bool:
+        """Return whether a playback host belongs to this device or its cameras."""
+        normalized_host = host.strip().strip("[]").lower()
+        if not normalized_host:
+            return False
+
+        allowed_hosts = set()
+        parsed_host = urlparse(self.host).hostname
+        if parsed_host:
+            allowed_hosts.add(parsed_host.lower())
+        if self.device_info.ip_address:
+            allowed_hosts.add(self.device_info.ip_address.lower())
+        for camera in self.cameras:
+            if isinstance(camera, IPCamera) and camera.ip_addr:
+                allowed_hosts.add(camera.ip_addr.lower())
+
+        if normalized_host in allowed_hosts:
+            return True
+
+        with suppress(ValueError):
+            normalized_ip = ipaddress.ip_address(normalized_host)
+            for allowed_host in allowed_hosts:
+                with suppress(ValueError):
+                    if normalized_ip == ipaddress.ip_address(allowed_host):
+                        return True
+
+        return False
+
+    async def download_recording_picture(self, playback_uri: str) -> bytes | None:
+        """Download a static recording picture."""
+        data = b"".join([chunk async for chunk in self.request_bytes(GET, playback_uri, timeout=self.timeout)])
+        if not data.startswith(b"\xff\xd8"):
+            _LOGGER.debug("Static recording picture response was not JPEG; playback_uri=%s bytes=%d", playback_uri, len(data))
+            return None
+        _LOGGER.debug("Downloaded static recording picture; playback_uri=%s bytes=%d", playback_uri, len(data))
+        return data
+
+    @staticmethod
+    def _format_recording_time(value: datetime.datetime) -> str:
+        """Format a datetime for ContentMgmt recording search."""
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=datetime.UTC)
+        return dt_util.as_local(value).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    @staticmethod
+    def _format_recording_picture_time(value: datetime.datetime) -> str:
+        """Format a datetime for ContentMgmt static picture search."""
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=datetime.UTC)
+        return dt_util.as_local(value).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    def _parse_recording_search_result(self, camera_id: int, result: dict) -> list[RecordingInfo]:
+        """Parse ContentMgmt search response into recording info."""
+        items = deep_get(result, "CMSearchResult.matchList.searchMatchItem", [])
+        if not items:
+            items = deep_get(result, "CMSearchResult.searchMatchItemList.searchMatchItem", [])
+        if not items:
+            return []
+        if not isinstance(items, list):
+            items = [items]
+
+        recordings = []
+        for item in items:
+            playback_uri = item.get("playbackURI") or deep_get(item, "mediaSegmentDescriptor.playbackURI")
+            if not playback_uri:
+                continue
+
+            time_span = item.get("timeSpan") or deep_get(item, "mediaSegmentDescriptor.timeSpan", {})
+            start_time = self._parse_recording_time(time_span.get("startTime"))
+            end_time = self._parse_recording_time(time_span.get("endTime"))
+            if not start_time or not end_time:
+                continue
+
+            parsed_uri = urlparse(playback_uri)
+            query = parse_qs(parsed_uri.query)
+            name = item.get("name") or query.get("name", [""])[0]
+            size = self._parse_int(item.get("size") or query.get("size", [0])[0])
+            track_id = self._parse_int(item.get("trackID") or query.get("trackID", [0])[0])
+            if not track_id:
+                track_id = self._parse_int(parsed_uri.path.rstrip("/").split("/")[-1])
+
+            recordings.append(
+                RecordingInfo(
+                    camera_id=camera_id,
+                    track_id=track_id,
+                    start_time=start_time,
+                    end_time=end_time,
+                    playback_uri=playback_uri,
+                    name=name,
+                    size=size,
+                    content_type=self._guess_recording_content_type(name),
+                )
+            )
+        return recordings
+
+    def _parse_recording_picture_search_result(self, camera_id: int, result: dict) -> list[RecordingPictureInfo]:
+        """Parse ContentMgmt search response into recording picture info."""
+        items = deep_get(result, "CMSearchResult.matchList.searchMatchItem", [])
+        if not items:
+            items = deep_get(result, "CMSearchResult.searchMatchItemList.searchMatchItem", [])
+        if not items:
+            return []
+        if not isinstance(items, list):
+            items = [items]
+
+        pictures = []
+        for item in items:
+            content_type = deep_get(item, "mediaSegmentDescriptor.contentType")
+            if content_type != "picture":
+                continue
+
+            playback_uri = item.get("playbackURI") or deep_get(item, "mediaSegmentDescriptor.playbackURI")
+            if not playback_uri:
+                continue
+
+            time_span = item.get("timeSpan") or deep_get(item, "mediaSegmentDescriptor.timeSpan", {})
+            start_time = self._parse_recording_time(time_span.get("startTime"))
+            end_time = self._parse_recording_time(time_span.get("endTime")) or start_time
+            if not start_time or not end_time:
+                continue
+
+            parsed_uri = urlparse(playback_uri)
+            query = parse_qs(parsed_uri.query)
+            track_id = self._parse_int(item.get("trackID") or query.get("trackID", [0])[0])
+            if not track_id:
+                track_id = self._parse_int(parsed_uri.path.rstrip("/").split("/")[-1])
+
+            pictures.append(
+                RecordingPictureInfo(
+                    camera_id=camera_id,
+                    track_id=track_id,
+                    start_time=start_time,
+                    end_time=end_time,
+                    playback_uri=playback_uri,
+                )
+            )
+        return pictures
+
+    @staticmethod
+    def _parse_recording_time(value: str | None) -> datetime.datetime | None:
+        """Parse an ISAPI recording timestamp as Hikvision local wall-clock time."""
+        if not value:
+            return None
+        cleaned = value.strip()
+        if cleaned.endswith("Z"):
+            cleaned = cleaned[:-1]
+        with suppress(ValueError):
+            parsed = datetime.datetime.fromisoformat(cleaned)
+            if parsed.tzinfo is None:
+                return parsed.replace(tzinfo=dt_util.DEFAULT_TIME_ZONE)
+            return dt_util.as_local(parsed)
+        with suppress(ValueError):
+            return datetime.datetime.strptime(cleaned, "%Y-%m-%d %H:%M:%S").replace(tzinfo=dt_util.DEFAULT_TIME_ZONE)
+        return None
+
+    @staticmethod
+    def _parse_int(value: Any) -> int:
+        """Parse an integer and return zero when parsing fails."""
+        with suppress(TypeError, ValueError):
+            return int(value)
+        return 0
+
+    def _recording_track_id(self, camera_id: int) -> int:
+        """Return the recording track id for a camera."""
+        camera = self.get_camera_by_id(camera_id)
+        return camera.streams[0].id if camera and camera.streams else camera_id * 100 + 1
+
+    @staticmethod
+    def _picture_track_id(track_id: int) -> int:
+        """Return the static picture track for a video track."""
+        if track_id % 10 == 3:
+            return track_id
+        return track_id + 2
+
+    @staticmethod
+    def _guess_recording_content_type(name: str) -> str:
+        """Guess the content type from a recording name."""
+        lower_name = name.lower()
+        if lower_name.endswith(".mp4"):
+            return "video/mp4"
+        if lower_name.endswith((".mpeg", ".mpg", ".ps")):
+            return "video/mpeg"
+        return "video/mp4"
 
     def _get_event_state_node(self, event: EventInfo) -> str:
         """Get xml key for event state."""
@@ -734,13 +1206,26 @@ class ISAPIClient:
         """Get stream source."""
         u = quote(self.username, safe="")
         p = quote(self.password, safe="")
-        url = f"{self.device_info.ip_address}:{self.protocols.rtsp_port}/Streaming/channels/{stream.id}"
+        url = f"{self.device_info.ip_address}:{self.protocols.rtsp_port}/ISAPI/Streaming/channels/{stream.id}"
         return f"rtsp://{u}:{p}@{url}"
+
+    def _build_session(self) -> httpx.AsyncClient:
+        """Build an HTTP client session."""
+        return httpx.AsyncClient(timeout=self.timeout, verify=self.verify_ssl)
+
+    def _reset_session(self) -> None:
+        """Reset session and force auth method redetection."""
+        self._session = self._build_session()
+        self._auth_method = None
+
+    def _ensure_session(self) -> None:
+        """Ensure an open HTTP session is available."""
+        if not self._session or getattr(self._session, "is_closed", False):
+            self._reset_session()
 
     async def _detect_auth_method(self):
         """Establish the connection with device."""
-        if not self._session:
-            self._session = httpx.AsyncClient(timeout=self.timeout, verify=self.verify_ssl)
+        self._ensure_session()
 
         url = urljoin(self.host, self.isapi_prefix + "/System/deviceInfo")
         _LOGGER.debug("--- [WWW-Authenticate detection] %s", self.host)
@@ -768,38 +1253,52 @@ class ISAPIClient:
         url: str,
         present: str = "dict",
         data: str = None,
+        headers: dict[str, str] | None = None,
     ) -> Any:
         """Send ISAPI request and log response, returns {} if request fails."""
         full_url = self.get_isapi_url(url)
-        try:
-            if not self._auth_method:
-                await self._detect_auth_method()
+        for attempt in range(2):
+            try:
+                self._ensure_session()
+                if not self._auth_method:
+                    await self._detect_auth_method()
 
-            response = await self._session.request(
-                method,
-                full_url,
-                auth=self._auth_method,
-                data=data,
-                timeout=self.timeout,
-            )
-            response.raise_for_status()
-            result = parse_isapi_response(response, present)
-            _LOGGER.debug("--- [%s] %s", method, full_url)
-            if data:
-                _LOGGER.debug(">>> payload:\n%s", data)
-            _LOGGER.debug("\n%s", result)
-        except HTTPStatusError as ex:
-            _LOGGER.info("--- [%s] %s\n%s", method, full_url, ex)
-            if ex.response.status_code == HTTPStatus.UNAUTHORIZED:
-                raise ISAPIUnauthorizedError(ex) from ex
-            if ex.response.status_code == HTTPStatus.FORBIDDEN and not self.pending_initialization:
-                raise ISAPIForbiddenError(ex) from ex
-            if self.pending_initialization:
-                # supress http errors during initialization
-                return {}
-            raise
-        else:
-            return result
+                response = await self._session.request(
+                    method,
+                    full_url,
+                    auth=self._auth_method,
+                    data=data,
+                    headers=headers,
+                    timeout=self.timeout,
+                )
+                response.raise_for_status()
+                result = parse_isapi_response(response, present)
+                _LOGGER.debug("--- [%s] %s", method, full_url)
+                if data:
+                    _LOGGER.debug(">>> payload:\n%s", data)
+                _LOGGER.debug("\n%s", result)
+                return result
+            except RuntimeError as ex:
+                if "client has been closed" in str(ex).lower() and attempt == 0:
+                    _LOGGER.debug("ISAPI session was closed; recreating session and retrying request")
+                    self._reset_session()
+                    continue
+                raise
+            except HTTPStatusError as ex:
+                _LOGGER.info("--- [%s] %s\n%s", method, full_url, ex)
+                if data:
+                    _LOGGER.debug(">>> failed payload:\n%s", data)
+                if ex.response.text:
+                    _LOGGER.debug("<<< failed response:\n%s", ex.response.text)
+                if ex.response.status_code == HTTPStatus.UNAUTHORIZED:
+                    raise ISAPIUnauthorizedError(ex) from ex
+                if ex.response.status_code == HTTPStatus.FORBIDDEN and not self.pending_initialization:
+                    raise ISAPIForbiddenError(ex) from ex
+                if self.pending_initialization:
+                    # supress http errors during initialization
+                    return {}
+                raise
+        return {}
 
     async def request_bytes(
         self,
@@ -808,16 +1307,41 @@ class ISAPIClient:
         **data,
     ) -> AsyncIterator[bytes]:
         """Send ISAPI request for binary data."""
+        for attempt in range(2):
+            try:
+                self._ensure_session()
+                if not self._auth_method:
+                    await self._detect_auth_method()
 
-        try:
-            if not self._auth_method:
-                await self._detect_auth_method()
+                byte_count = 0
+                async with self._session.stream(method, full_url, auth=self._auth_method, **data) as response:
+                    _LOGGER.debug(
+                        "--- [%s] %s status=%s content_type=%s content_length=%s",
+                        method,
+                        full_url,
+                        response.status_code,
+                        response.headers.get("content-type"),
+                        response.headers.get("content-length"),
+                    )
+                    if response.status_code >= HTTPStatus.BAD_REQUEST:
+                        body = await response.aread()
+                        _LOGGER.debug("<<< failed byte response:\n%s", body.decode(errors="replace"))
+                        response.raise_for_status()
 
-            async with self._session.stream(method, full_url, auth=self._auth_method, **data) as response:
-                async for chunk in response.aiter_bytes():
-                    yield chunk
-        except httpx.HTTPError as ex:
-            _LOGGER.warning("Failed request [%s] %s | %s", method, full_url, ex)
+                    async for chunk in response.aiter_bytes():
+                        byte_count += len(chunk)
+                        yield chunk
+                _LOGGER.debug("--- [%s] %s streamed_bytes=%d", method, full_url, byte_count)
+                return
+            except RuntimeError as ex:
+                if "client has been closed" in str(ex).lower() and attempt == 0:
+                    _LOGGER.debug("ISAPI session was closed; recreating session and retrying binary request")
+                    self._reset_session()
+                    continue
+                raise
+            except httpx.HTTPError as ex:
+                _LOGGER.warning("Failed request [%s] %s | %s", method, full_url, ex)
+                return
 
 
 class ISAPISetEventStateMutexError(Exception):

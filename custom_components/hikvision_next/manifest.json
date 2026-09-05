@@ -1,10 +1,9 @@
 {
   "domain": "hikvision_next",
   "name": "Hikvision NVR / IP Camera",
-  "after_dependencies": ["http", "network"],
+  "after_dependencies": ["http", "media_source", "network"],
   "codeowners": ["@maciej-or"],
   "config_flow": true,
-  "dependencies": [],
   "documentation": "https://github.com/maciej-or/hikvision_next",
   "integration_type": "device",
   "iot_class": "local_polling",

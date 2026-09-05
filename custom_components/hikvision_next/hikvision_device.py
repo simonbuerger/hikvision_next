@@ -90,6 +90,10 @@ class HikvisionDevice(ISAPIClient):
         for coordinator in self.coordinators.values():
             await coordinator.async_config_entry_first_refresh()
 
+    def _build_session(self) -> httpx.AsyncClient:
+        """Build an HTTP client bound to Home Assistant's shared session settings."""
+        return get_async_client(self.hass, self.verify_ssl)
+
     def hass_device_info(self, camera_id: int = 0) -> DeviceInfo:
         """Return Home Assistant entity device information."""
         if camera_id == 0:
